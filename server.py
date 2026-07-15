@@ -1,58 +1,39 @@
-import os
-import sys
-from fastmcp import FastMCP
-from kubernetes import client, config
-from kubernetes.client.rest import ApiException
+from mcp.server.fastmcp import FastMCP
+import subprocess
+import json
 
-# Initialize FastMCP Server
-mcp = FastMCP("k8s-platform-mcp")
-
-try:
-    if os.getenv("KUBERNETES_SERVICE_HOST"):
-        config.load_incluster_config()
-    else:
-        config.load_kube_config()
-    v1 = client.CoreV1Api()
-except Exception as e:
-    v1 = None
-
-@mcp.tool()
-def get_cluster_context() -> str:
-    """Returns the active Kubernetes context details."""
-    if not v1:
-        return "Error: Kubernetes client not initialized. Local kubeconfig not found."
-    try:
-        contexts, active_context = config.list_kube_config_contexts()
-        if not active_context:
-            return "Connected to: In-Cluster Configuration (Pod ServiceAccount)"
-        
-        # Fixed: Removed syntax issue with trailing comma in the dict lookup
-        context_info = active_context.get('context', {})
-        
-        # Fixed: Added curly braces to properly evaluate f-string variables
-        return f"Active Context: {active_context.get('name')}\nCluster: {context_info.get('cluster')}\nAuth User: {context_info.get('user')}\nNamespace: {context_info.get('namespace', 'default')}"
-    except Exception as e:
-        return f"Failed to fetch context info: {str(e)}"
+# Initialize FastMCP Server for Kubernetes
+mcp = FastMCP("k8s-mcp-server")
 
 @mcp.tool()
 def list_pods(namespace: str = "default") -> str:
-    """List all pods in a given Kubernetes namespace. Returns pod name, status, restarts, and IP."""
-    if not v1:
-        return "Error: Kubernetes client not initialized."
+    """List all pods in a given Kubernetes namespace and show their status."""
     try:
-        pods = v1.list_namespaced_pod(namespace=namespace)
-        pod_list = []
-        for pod in pods.items:
-            restarts = 0
-            if pod.status.container_statuses:
-                restarts = sum(cs.restart_count for cs in pod.status.container_statuses)
-            # Fixed: Added evaluation brackets for variables inside the f-string
-            pod_list.append(
-                f"Name: {pod.metadata.name} | Status: {pod.status.phase} | Restarts: {restarts} | IP: {pod.status.pod_ip}"
-            )
-        return "\n".join(pod_list) if pod_list else "No pods found in this namespace."
-    except ApiException as e:
-        return f"K8s API Error: {e.reason}"
+        result = subprocess.run(
+            ["kubectl", "get", "pods", "-n", namespace, "-o", "json"],
+            capture_output=True, text=True, check=True
+        )
+        data = json.loads(result.stdout)
+        pods = []
+        for item in data.get("items", []):
+            name = item["metadata"]["name"]
+            status = item["status"]["phase"]
+            pods.append(f"- **{name}**: {status}")
+        return "\n".join(pods) if pods else "No pods found in this namespace."
+    except Exception as e:
+        return f"Error listing pods: {str(e)}"
+
+@mcp.tool()
+def get_pod_logs(pod_name: str, namespace: str = "default", tail_lines: int = 50) -> str:
+    """Retrieve the last N lines of logs from a specific pod."""
+    try:
+        result = subprocess.run(
+            ["kubectl", "logs", pod_name, "-n", namespace, f"--tail={tail_lines}"],
+            capture_output=True, text=True, check=True
+        )
+        return result.stdout if result.stdout else "Logs are empty."
+    except Exception as e:
+        return f"Error retrieving logs: {str(e)}"
 
 if __name__ == "__main__":
     mcp.run()
