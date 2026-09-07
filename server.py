@@ -1,115 +1,147 @@
-from typing import Annotated, Optional
-from pydantic import Field
-from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
-import subprocess
-import json
+"""
+Kubernetes MCP Server
+A Model Context Protocol server for debugging, analyzing, and diagnosing Kubernetes clusters.
+"""
 
-# Initialize FastMCP Server for Kubernetes
-# This server is READ-ONLY: it never creates, modifies, or deletes cluster resources.
+from typing import Optional
+from mcp.server.fastmcp import FastMCP
+from pydantic import Field
+from kubernetes import client, config
+
+# Initialize FastMCP Server
 mcp = FastMCP("k8s-mcp-server")
 
-READ_ONLY = ToolAnnotations(
-    readOnlyHint=True,
-    destructiveHint=False,
-    idempotentHint=True,
-    openWorldHint=False,
-)
 
-
-def _run_kubectl(args: list[str]) -> subprocess.CompletedProcess:
-    """Run a kubectl command and return the completed process, raising on non-zero exit."""
-    return subprocess.run(args, capture_output=True, text=True, check=True)
-
-
-@mcp.tool(annotations=READ_ONLY)
-def list_pods(
-    namespace: Annotated[str, Field(description="Kubernetes namespace to list pods from.")] = "default",
-) -> str:
-    """List all pods in a given Kubernetes namespace along with pod phase and per-container ready state.
-
-    This is a read-only operation (runs `kubectl get pods -n <namespace> -o json`) and never
-    mutates cluster state.
-
-    Returns a newline-separated list formatted as:
-        - <pod-name>: phase=<Phase> containers=[<container>: ready=<bool> restarts=<n>, ...]
-
-    Example:
-        - web-7f9c: phase=Running containers=[web: ready=True restarts=0]
-        - worker-2a1b: phase=Running containers=[worker: ready=False restarts=5]
-
-    If no pods are found, returns "No pods found in this namespace."
-    On failure, returns a string prefixed with "Error listing pods:" containing the kubectl error.
-    """
+def _load_kube_config() -> None:
+    """Load local kubeconfig or cluster configuration."""
     try:
-        result = _run_kubectl(["kubectl", "get", "pods", "-n", namespace, "-o", "json"])
-        data = json.loads(result.stdout)
-        pods = []
-        for item in data.get("items", []):
-            name = item["metadata"]["name"]
-            phase = item["status"].get("phase", "Unknown")
-            container_statuses = item["status"].get("containerStatuses", [])
-            containers = [
-                f"{c['name']}: ready={c.get('ready', False)} restarts={c.get('restartCount', 0)}"
-                for c in container_statuses
-            ]
-            containers_str = ", ".join(containers) if containers else "no container status"
-            pods.append(f"- {name}: phase={phase} containers=[{containers_str}]")
-        return "\n".join(pods) if pods else "No pods found in this namespace."
-    except Exception as e:
-        return f"Error listing pods: {str(e)}"
+        config.load_incluster_config()
+    except config.ConfigException:
+        config.load_kube_config()
 
 
-@mcp.tool(annotations=READ_ONLY)
-def get_pod_logs(
-    pod_name: Annotated[str, Field(description="Name of the pod to fetch logs from.")],
-    namespace: Annotated[str, Field(description="Kubernetes namespace the pod lives in.")] = "default",
-    tail_lines: Annotated[int, Field(description="Number of most recent log lines to retrieve.", ge=1, le=10000)] = 50,
-    container: Annotated[
-        Optional[str],
-        Field(description="Container name to fetch logs from. Required if the pod has more than one container."),
-    ] = None,
-) -> str:
-    """Retrieve the last N lines of logs from a specific pod (optionally a specific container).
-
-    Read-only: runs `kubectl logs <pod> -n <namespace> --tail=<n> [-c <container>]`.
-
-    If the pod has multiple containers and `container` is not specified, kubectl will error;
-    pass `container` explicitly in that case.
-
-    Returns raw log text, or "Logs are empty." if there is no output.
-    On failure, returns a string prefixed with "Error retrieving logs:" containing the kubectl error.
+@mcp.tool()
+async def list_namespaces() -> str:
     """
-    try:
-        args = ["kubectl", "logs", pod_name, "-n", namespace, f"--tail={tail_lines}"]
-        if container:
-            args.extend(["-c", container])
-        result = _run_kubectl(args)
-        return result.stdout if result.stdout else "Logs are empty."
-    except Exception as e:
-        return f"Error retrieving logs: {str(e)}"
+    List all namespaces available in the Kubernetes cluster.
 
-
-@mcp.tool(annotations=READ_ONLY)
-def describe_pod(
-    pod_name: Annotated[str, Field(description="Name of the pod to describe.")],
-    namespace: Annotated[str, Field(description="Kubernetes namespace the pod lives in.")] = "default",
-) -> str:
-    """Return detailed information about a pod: conditions, events, resource requests/limits, and volumes.
-
-    Read-only: runs `kubectl describe pod <pod_name> -n <namespace>`.
-
-    Useful for diagnosing scheduling failures, image pull errors, OOMKills, and CrashLoopBackOff
-    root causes that aren't visible from `list_pods` alone.
-
-    Returns the raw kubectl describe output as text.
-    On failure, returns a string prefixed with "Error describing pod:" containing the kubectl error.
+    Use this tool to discover cluster boundaries and verify target namespaces
+    before querying pod or service resources.
     """
+    _load_kube_config()
+    v1 = client.CoreV1Api()
+    namespaces = v1.list_namespace()
+    names = [ns.metadata.name for ns in namespaces.items if ns.metadata and ns.metadata.name]
+    return f"Namespaces ({len(names)}):\n" + "\n".join(f"- {name}" for name in names)
+
+
+@mcp.tool()
+async def list_pods(
+    namespace: str = Field(
+        default="default",
+        description="Kubernetes namespace to list pods from. Defaults to 'default'.",
+    ),
+    label_selector: Optional[str] = Field(
+        default=None,
+        description="Optional Kubernetes label query (e.g. 'app=frontend' or 'tier=backend').",
+    ),
+) -> str:
+    """
+    List pods within a specific namespace with status and container readiness.
+
+    Returns the pod name, status phase, restart counts, and IP address.
+    """
+    _load_kube_config()
+    v1 = client.CoreV1Api()
+    kwargs = {}
+    if label_selector:
+        kwargs["label_selector"] = label_selector
+
+    pods = v1.list_namespaced_pod(namespace=namespace, **kwargs)
+    if not pods.items:
+        return f"No pods found in namespace '{namespace}'."
+
+    results = []
+    for p in pods.items:
+        name = p.metadata.name if p.metadata else "unknown"
+        phase = p.status.phase if p.status else "Unknown"
+        pod_ip = p.status.pod_ip if p.status else "None"
+        results.append(f"- {name} | Phase: {phase} | IP: {pod_ip}")
+
+    return f"Pods in '{namespace}' ({len(results)}):\n" + "\n".join(results)
+
+
+@mcp.tool()
+async def get_pod_logs(
+    pod_name: str = Field(
+        description="The exact name of the pod to retrieve logs from.",
+    ),
+    namespace: str = Field(
+        default="default",
+        description="Kubernetes namespace containing the pod.",
+    ),
+    tail_lines: int = Field(
+        default=100,
+        description="Number of most recent log lines to fetch. Default is 100.",
+    ),
+    container: Optional[str] = Field(
+        default=None,
+        description="Specific container name if the pod contains multiple containers.",
+    ),
+) -> str:
+    """
+    Fetch stdout and stderr container logs from a specific pod for troubleshooting.
+
+    Use this tool to diagnose crash loops, runtime errors, or startup failures.
+    """
+    _load_kube_config()
+    v1 = client.CoreV1Api()
+    kwargs = {"tail_lines": tail_lines}
+    if container:
+        kwargs["container"] = container
+
     try:
-        result = _run_kubectl(["kubectl", "describe", "pod", pod_name, "-n", namespace])
-        return result.stdout if result.stdout else "No description output returned."
+        logs = v1.read_namespaced_pod_log(name=pod_name, namespace=namespace, **kwargs)
+        return logs or "(No logs returned)"
     except Exception as e:
-        return f"Error describing pod: {str(e)}"
+        return f"Error retrieving logs for pod {pod_name}: {str(e)}"
+
+
+@mcp.tool()
+async def get_cluster_events(
+    namespace: Optional[str] = Field(
+        default="default",
+        description="Namespace to inspect for warning and error events. Pass 'all' or omit for all namespaces.",
+    ),
+    warning_only: bool = Field(
+        default=True,
+        description="When true, filters only Warning events (e.g. BackOff, FailedScheduling, Unhealthy).",
+    ),
+) -> str:
+    """
+    Retrieve Kubernetes cluster events to diagnose scheduling failures or unhealthy workloads.
+    """
+    _load_kube_config()
+    v1 = client.CoreV1Api()
+    if namespace and namespace.lower() != "all":
+        events = v1.list_namespaced_event(namespace=namespace)
+    else:
+        events = v1.list_event_for_all_namespaces()
+
+    matched = []
+    for event in events.items:
+        event_type = event.type or "Normal"
+        if warning_only and event_type != "Warning":
+            continue
+        obj = event.involved_object.name if event.involved_object else "cluster"
+        reason = event.reason or "UnknownReason"
+        message = event.message or ""
+        matched.append(f"[{event_type}] {obj} - {reason}: {message}")
+
+    if not matched:
+        return "No matching events found."
+
+    return f"Events ({len(matched)}):\n" + "\n".join(matched[-50:])
 
 
 if __name__ == "__main__":
