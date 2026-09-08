@@ -1,255 +1,304 @@
-"""
-Kubernetes MCP Server
-A read-only Model Context Protocol server providing rich diagnostics, resource
-inspection, and log streaming for Kubernetes clusters.
-"""
-
-from typing import Optional
+import os
+import logging
+from typing import Any, Dict, List, Optional
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 from kubernetes import client, config
 
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("k8s-mcp-server")
+
+# Initialize FastMCP Server
 mcp = FastMCP(
-    "k8s-mcp-server",
+    name="k8s-mcp-server",
     instructions=(
-        "Use this server to safely inspect, troubleshoot, and diagnose Kubernetes "
-        "cluster resources. All tools are strictly read-only. Always check namespaces "
-        "first when the target namespace is unknown or ambiguous."
+        "Production-grade MCP server for Kubernetes cluster diagnostics, workload health, "
+        "and pod event inspection. Enforces strict read-only cluster observation."
     ),
 )
 
 
-def _load_kube_config() -> None:
-    """Load in-cluster service account credentials or fallback to local kubeconfig."""
+def _init_k8s_client():
+    """Initializes Kubernetes client from in-cluster service account or local kubeconfig."""
     try:
         config.load_incluster_config()
     except config.ConfigException:
         config.load_kube_config()
 
 
+# ==============================================================================
+# Cluster Health & Node Inspection
+# ==============================================================================
+
+
 @mcp.tool()
-async def list_namespaces() -> str:
+async def get_cluster_nodes() -> List[Dict[str, Any]]:
     """
-    List all namespaces present in the connected Kubernetes cluster.
+    List all cluster nodes with internal IP addresses, roles, Kubernetes versions, and ready states.
 
     ### Usage Guidelines
-    - Call this tool first when discovering available cluster domains or when
-      the user does not supply an explicit namespace.
-    - Do not use this tool to inspect workload health; use `list_pods` instead.
-
-    ### Behavioral Transparency
-    - Read-only operation.
-    - Scans cluster-wide namespace resources using CoreV1Api.
-    - Returns an alphabetically sorted list of namespace names with total count.
+    - Diagnostic discovery tool for inspecting node capacity and Kubernetes control plane versions.
     """
-    _load_kube_config()
-    v1 = client.CoreV1Api()
-    namespaces = v1.list_namespace()
-    names = sorted(
-        [ns.metadata.name for ns in namespaces.items if ns.metadata and ns.metadata.name]
-    )
-    if not names:
-        return "No namespaces found or insufficient RBAC read permissions."
-    return f"Cluster Namespaces ({len(names)} total):\n" + "\n".join(f"- {n}" for n in names)
+    _init_k8s_client()
+    core_api = client.CoreV1Api()
+    nodes = core_api.list_node()
+
+    results = []
+    for node in nodes.items:
+        conditions = {c.type: c.status for c in node.status.conditions}
+        ready_status = conditions.get("Ready", "Unknown")
+
+        roles = [
+            label.split("/")[-1]
+            for label in node.metadata.labels
+            if label.startswith("node-role.kubernetes.io/")
+        ]
+
+        results.append(
+            {
+                "name": node.metadata.name,
+                "status": "Ready" if ready_status == "True" else "NotReady",
+                "roles": roles or ["worker"],
+                "kubelet_version": node.status.node_info.kubelet_version,
+                "os_image": node.status.node_info.os_image,
+                "capacity": {
+                    "cpu": node.status.capacity.get("cpu"),
+                    "memory": node.status.capacity.get("memory"),
+                    "pods": node.status.capacity.get("pods"),
+                },
+            }
+        )
+    return results
+
+
+# ==============================================================================
+# Pod Diagnostics & Log Streaming
+# ==============================================================================
 
 
 @mcp.tool()
-async def list_pods(
+async def get_pod_diagnostics(
     namespace: str = Field(
         default="default",
-        description="Target Kubernetes namespace (e.g. 'kube-system', 'production', or 'default').",
+        description="Target Kubernetes namespace containing the pods to inspect.",
     ),
     label_selector: Optional[str] = Field(
         default=None,
-        description="Kubernetes label query expression to filter pods (e.g. 'app=frontend' or 'tier=backend').",
+        description="Kubernetes label selector expression (e.g. 'app=api' or 'tier=backend').",
     ),
-) -> str:
+) -> List[Dict[str, Any]]:
     """
-    List pods within a specified namespace along with their lifecycle phase and IP address.
+    Inspect pod health across a namespace, detecting restart counts, OOMKills, and CrashLoopBackOffs.
 
     ### Usage Guidelines
-    - Use this tool when identifying running workloads, crash loops, or verifying pod readiness.
-    - If troubleshooting a failing pod, pass its name to `get_pod_logs` or call `get_cluster_events`.
-
-    ### Behavioral Transparency
-    - Read-only operation.
-    - Omits internal container state arrays; highlights high-level phase (Running, Pending, Failed).
+    - Evaluates container state transitions and abnormal restart loops for incident debugging.
     """
-    _load_kube_config()
-    v1 = client.CoreV1Api()
+    _init_k8s_client()
+    core_api = client.CoreV1Api()
     kwargs = {}
     if label_selector:
         kwargs["label_selector"] = label_selector
 
-    pods = v1.list_namespaced_pod(namespace=namespace, **kwargs)
-    if not pods.items:
-        return f"No pods found in namespace '{namespace}' matching selector '{label_selector or 'none'}'."
+    pods = core_api.list_namespaced_pod(namespace=namespace, **kwargs)
 
-    results = []
-    for p in pods.items:
-        name = p.metadata.name if p.metadata else "unknown"
-        phase = p.status.phase if p.status else "Unknown"
-        ip = p.status.pod_ip if p.status else "Pending"
-        results.append(f"- Pod: {name} | Status: {phase} | IP: {ip}")
+    diagnostics = []
+    for pod in pods.items:
+        containers_summary = []
+        has_abnormal_state = False
 
-    return f"Pods in namespace '{namespace}' ({len(results)} found):\n" + "\n".join(results)
+        if pod.status.container_statuses:
+            for c in pod.status.container_statuses:
+                state_str = "Running"
+                reason = None
+                if c.state.waiting:
+                    state_str = "Waiting"
+                    reason = c.state.waiting.reason
+                    has_abnormal_state = True
+                elif c.state.terminated:
+                    state_str = "Terminated"
+                    reason = c.state.terminated.reason
+                    if c.state.terminated.exit_code != 0:
+                        has_abnormal_state = True
+
+                containers_summary.append(
+                    {
+                        "name": c.name,
+                        "ready": c.ready,
+                        "restart_count": c.restart_count,
+                        "state": state_str,
+                        "reason": reason,
+                    }
+                )
+
+        diagnostics.append(
+            {
+                "name": pod.metadata.name,
+                "phase": pod.status.phase,
+                "pod_ip": pod.status.pod_ip,
+                "node_name": pod.spec.node_name,
+                "abnormal_state": has_abnormal_state,
+                "containers": containers_summary,
+            }
+        )
+    return diagnostics
 
 
 @mcp.tool()
 async def get_pod_logs(
-    pod_name: str = Field(
-        description="Exact identifier name of the pod whose logs should be extracted (e.g. 'nginx-7854ff8877-abcde').",
-    ),
     namespace: str = Field(
-        default="default",
-        description="Kubernetes namespace where the target pod resides. Defaults to 'default'.",
+        description="Kubernetes namespace containing the target pod.",
+    ),
+    pod_name: str = Field(
+        description="Exact metadata name of the pod to extract stdout/stderr logs from.",
+    ),
+    container_name: Optional[str] = Field(
+        default=None,
+        description="Target container name within multi-container pods. Defaults to primary container.",
     ),
     tail_lines: int = Field(
         default=100,
-        ge=1,
-        le=2000,
-        description="Number of most recent log lines to fetch. Constrained between 1 and 2000. Defaults to 100.",
+        ge=10,
+        le=500,
+        description="Number of most recent log lines to retrieve (between 10 and 500).",
     ),
-    container: Optional[str] = Field(
-        default=None,
-        description="Specific container name within a multi-container pod. If omitted, Kubernetes selects the primary container.",
+    previous: bool = Field(
+        default=False,
+        description="If true, prints the logs for the previous instance of the container if it crashed.",
     ),
-) -> str:
+) -> Dict[str, Any]:
     """
-    Extract stdout and stderr log streams from a pod container for diagnostics.
+    Retrieve real-time or post-crash container logs from a specific pod.
 
     ### Usage Guidelines
-    - Use when investigating application crashes, HTTP 500 errors, or startup exceptions.
-    - Keep `tail_lines` small (e.g. 50–200) to avoid overloading LLM token context.
-
-    ### Behavioral Transparency
-    - Read-only query.
-    - Returns raw text log lines or a descriptive error if the pod or container does not exist.
+    - Crucial for diagnosing root causes during CrashLoopBackOff or application startup failures.
     """
-    _load_kube_config()
-    v1 = client.CoreV1Api()
-    kwargs = {"tail_lines": tail_lines}
-    if container:
-        kwargs["container"] = container
+    _init_k8s_client()
+    core_api = client.CoreV1Api()
+    kwargs: Dict[str, Any] = {
+        "namespace": namespace,
+        "name": pod_name,
+        "tail_lines": tail_lines,
+        "previous": previous,
+    }
+    if container_name:
+        kwargs["container"] = container_name
 
     try:
-        logs = v1.read_namespaced_pod_log(name=pod_name, namespace=namespace, **kwargs)
-        return logs or f"(No log lines recorded for pod '{pod_name}')"
-    except Exception as e:
-        return f"Failed to retrieve logs for pod '{pod_name}' in namespace '{namespace}': {str(e)}"
+        logs = core_api.read_namespaced_pod_log(**kwargs)
+        return {
+            "pod_name": pod_name,
+            "namespace": namespace,
+            "container": container_name or "primary",
+            "lines_retrieved": len(logs.splitlines()),
+            "logs": logs,
+        }
+    except client.exceptions.ApiException as e:
+        return {
+            "error": True,
+            "status": e.status,
+            "reason": e.reason,
+            "message": e.body,
+        }
+
+
+# ==============================================================================
+# Events & Ingress Inspection
+# ==============================================================================
 
 
 @mcp.tool()
-async def get_cluster_events(
+async def list_warning_events(
     namespace: Optional[str] = Field(
-        default="default",
-        description="Namespace to query for events. Pass a specific namespace or 'all' to inspect entire cluster.",
+        default=None,
+        description="Target namespace to filter warning events. If omitted, queries cluster-wide events.",
     ),
-    warning_only: bool = Field(
-        default=True,
-        description="When true, filters only Warning events (e.g. BackOff, FailedScheduling, Unhealthy).",
-    ),
-) -> str:
+) -> List[Dict[str, Any]]:
     """
-    Retrieve Kubernetes cluster events to diagnose scheduling failures, node pressure, or eviction warnings.
+    Query recent Warning events across pods, PVCs, nodes, and deployments.
 
     ### Usage Guidelines
-    - Call this tool when pods remain stuck in 'Pending' or 'CrashLoopBackOff' states.
-    - Use `warning_only=True` to eliminate normal informational noise during triage.
-
-    ### Behavioral Transparency
-    - Read-only query.
-    - Returns up to the 50 most recent events formatted with event type, target resource, reason, and message.
+    - Surfaces FailedScheduling, FailedMount, BackOff, and Unhealthy probe warnings.
     """
-    _load_kube_config()
-    v1 = client.CoreV1Api()
-    if namespace and namespace.lower() != "all":
-        events = v1.list_namespaced_event(namespace=namespace)
+    _init_k8s_client()
+    core_api = client.CoreV1Api()
+    field_selector = "type=Warning"
+
+    if namespace:
+        events = core_api.list_namespaced_event(namespace=namespace, field_selector=field_selector)
     else:
-        events = v1.list_event_for_all_namespaces()
+        events = core_api.list_event_for_all_namespaces(field_selector=field_selector)
 
-    matched = []
-    for event in events.items:
-        etype = event.type or "Normal"
-        if warning_only and etype != "Warning":
-            continue
-        obj = event.involved_object.name if event.involved_object else "cluster"
-        reason = event.reason or "UnknownReason"
-        msg = event.message or ""
-        matched.append(f"[{etype}] {obj} ({reason}): {msg}")
-
-    if not matched:
-        return f"No matching events found for namespace '{namespace or 'all'}ld (warning_only={warning_only})."
-
-    return f"Events ({len(matched)} matching):\n" + "\n".join(matched[-50:])
+    results = []
+    for ev in events.items:
+        results.append(
+            {
+                "namespace": ev.metadata.namespace,
+                "reason": ev.reason,
+                "message": ev.message,
+                "involved_object": f"{ev.involved_object.kind}/{ev.involved_object.name}",
+                "count": ev.count,
+                "first_timestamp": ev.first_timestamp.isoformat() if ev.first_timestamp else None,
+                "last_timestamp": ev.last_timestamp.isoformat() if ev.last_timestamp else None,
+            }
+        )
+    return results
 
 
 @mcp.tool()
-async def list_deployments(
-    namespace: str = Field(
-        default="default",
-        description="Target Kubernetes namespace to list deployments from. Defaults to 'default'.",
+async def list_ingresses(
+    namespace: Optional[str] = Field(
+        default=None,
+        description="Target namespace to list ingress routes from. If omitted, scans across all namespaces.",
     ),
-) -> str:
+) -> List[Dict[str, Any]]:
     """
-    List deployments in a namespace with desired vs available replica counts.
+    Inspect HTTP/HTTPS routing configurations, ingress classes, hosts, and TLS certificates.
 
     ### Usage Guidelines
-    - Use this tool to verify rollout status and check whether workloads meet desired scale.
-    - When replicas show 0 available, use `list_pods` and `get_cluster_events` to locate the failure.
-
-    ### Behavioral Transparency
-    - Read-only operation using AppsV1Api.
-    - Returns name, desired replicas, and ready replica count.
+    - Useful for network troubleshooting, DNS routing audits, and TLS certificate inspection.
     """
-    _load_kube_config()
-    apps_v1 = client.AppsV1Api()
-    deployments = apps_v1.list_namespaced_deployment(namespace=namespace)
-    if not deployments.items:
-        return f"No deployments found in namespace '{namespace}'."
+    _init_k8s_client()
+    networking_api = client.NetworkingV1Api()
+
+    if namespace:
+        ingresses = networking_api.list_namespaced_ingress(namespace=namespace)
+    else:
+        ingresses = networking_api.list_ingress_for_all_namespaces()
 
     results = []
-    for d in deployments.items:
-        name = d.metadata.name if d.metadata else "unknown"
-        replicas = d.spec.replicas if d.spec else 0
-        ready = d.status.ready_replicas if (d.status and d.status.ready_replicas) else 0
-        results.append(f"- Deployment: {name} | Replicas: {ready}/{replicas} Ready")
+    for ing in ingresses.items:
+        rules = []
+        if ing.spec.rules:
+            for rule in ing.spec.rules:
+                paths = []
+                if rule.http and rule.http.paths:
+                    for p in rule.http.paths:
+                        paths.append(
+                            {
+                                "path": p.path,
+                                "path_type": p.path_type,
+                                "service": p.backend.service.name if p.backend.service else None,
+                                "port": p.backend.service.port.number if p.backend.service and p.backend.service.port else None,
+                            }
+                        )
+                rules.append({"host": rule.host, "paths": paths})
 
-    return f"Deployments in namespace '{namespace}' ({len(results)} found):\n" + "\n".join(results)
+        tls_hosts = []
+        if ing.spec.tls:
+            for tls in ing.spec.tls:
+                tls_hosts.extend(tls.hosts or [])
 
-
-@mcp.tool()
-async def list_services(
-    namespace: str = Field(
-        default="default",
-        description="Target Kubernetes namespace to inspect services in. Defaults to 'default'.",
-    ),
-) -> str:
-    """
-    List Kubernetes services, exposed ports, and service types within a namespace.
-
-    ### Usage Guidelines
-    - Use this tool when checking network ingress, internal DNS resolution, or service endpoints.
-    - Complement with `list_pods` to confirm underlying backend endpoints exist.
-
-    ### Behavioral Transparency
-    - Read-only query using CoreV1Api.
-    - Lists service name, type (ClusterIP, NodePort, LoadBalancer), and mapped ports.
-    """
-    _load_kube_config()
-    v1 = client.CoreV1Api()
-    services = v1.list_namespaced_service(namespace=namespace)
-    if not services.items:
-        return f"No services found in namespace '{namespace}'."
-
-    results = []
-    for s in services.items:
-        name = s.metadata.name if s.metadata else "unknown"
-        stype = s.spec.type if s.spec else "ClusterIP"
-        ports = [f"{p.port}:{p.target_port}/{p.protocol}" for p in (s.spec.ports or [])] if s.spec else []
-        results.append(f"- Service: {name} | Type: {stype} | Ports: {', '.join(ports) or 'None'}")
-
-    return f"Services in namespace '{namespace}' ({len(results)} found):\n" + "\n".join(results)
+        results.append(
+            {
+                "name": ing.metadata.name,
+                "namespace": ing.metadata.namespace,
+                "ingress_class_name": ing.spec.ingress_class_name,
+                "rules": rules,
+                "tls_hosts": tls_hosts,
+            }
+        )
+    return results
 
 
 if __name__ == "__main__":

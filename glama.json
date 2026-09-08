@@ -1,5 +1,5 @@
 {
-    "$schema": "[https://glama.ai/mcp/schemas/server.json](https://glama.ai/mcp/schemas/server.json)",
+    "$schema": "https://glama.ai/mcp/schemas/server.json",
     "maintainers": [
         "akkireddy-challa"
     ]
